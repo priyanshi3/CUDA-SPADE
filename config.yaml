@@ -1,0 +1,84 @@
+# CUDA-SPADE Configuration
+#
+# mode: "demo"  — synthetic sensors, faults injected automatically
+# mode: "live"  — read from real hardware (set protocol: under each sensor)
+
+mode: demo
+poll_interval_s: 2.0          # seconds between detection cycles
+
+# ── Sensors ───────────────────────────────────────────────────────────────────
+sensors:
+
+  - id: motor_temp
+    name: "Motor Temperature"
+    sensor_type: temperature    # used for demo fault descriptions
+    unit: "C"
+    sample_rate_hz: 100         # Hz — samples collected per second
+    baseline: 65.0              # deg C at normal load
+    noise: 0.3
+    detection:
+      algorithm: zscore
+      window: 100               # sliding window width in samples
+      threshold: 3.0            # flag if Z > threshold
+    # Live sensor (ignored in demo mode):
+    # protocol: modbus
+    # host: 192.168.1.100
+    # port: 502
+    # register: 40001
+
+  - id: bearing_vib
+    name: "Bearing Vibration"
+    sensor_type: vibration
+    unit: "m/s2"
+    sample_rate_hz: 1000        # accelerometer at 1 kHz
+    baseline: 0.0
+    noise: 0.05
+    detection:
+      algorithm: fft            # cuFFT spectral analysis (Phase 3)
+      threshold_multiplier: 5.0 # flag bins > multiplier * median power
+    # Live sensor:
+    # protocol: daq
+    # device: "Dev1"
+    # channel: "ai0"
+
+  - id: hydraulic_pres
+    name: "Hydraulic Pressure"
+    sensor_type: pressure
+    unit: "bar"
+    sample_rate_hz: 100
+    baseline: 180.0
+    noise: 1.5
+    detection:
+      algorithm: zscore
+      window: 100
+      threshold: 3.5
+    # Live sensor:
+    # protocol: modbus
+    # host: 192.168.1.101
+    # register: 40010
+
+  - id: motor_current
+    name: "Motor Current"
+    sensor_type: current
+    unit: "A"
+    sample_rate_hz: 100
+    baseline: 12.5
+    noise: 0.15
+    detection:
+      algorithm: zscore
+      window: 100
+      threshold: 3.0
+    # Live sensor:
+    # protocol: modbus
+    # host: 192.168.1.100
+    # register: 40020
+
+# ── Alerts ────────────────────────────────────────────────────────────────────
+alerts:
+  log_file: "logs/spade_alerts.log"   # created automatically if missing
+
+# ── Demo settings ─────────────────────────────────────────────────────────────
+demo:
+  # Inject a fault every N cycles.  At 2 s/cycle, 15 cycles = every 30 s.
+  # Faults rotate: temp spike → bearing BPFO → pressure drop → current overload
+  fault_injection_interval_cycles: 15
