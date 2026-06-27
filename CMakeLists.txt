@@ -24,3 +24,29 @@ set(CMAKE_CUDA_FLAGS_RELEASE "-O3")         # Max optimisation
 
 add_subdirectory(src)
 add_subdirectory(tests)
+
+# ── Python bindings (optional) ────────────────────────────────────────────────
+# Builds a .pyd (Windows) / .so (Linux) that Python can import as spade_cuda.
+# Requires pybind11:  pip install pybind11
+#
+# Discovery: ask the active Python interpreter where pybind11 put its CMake
+# config, then use that path with find_package.
+find_package(Python3 QUIET COMPONENTS Interpreter Development)
+if(Python3_FOUND)
+    execute_process(
+        COMMAND "${Python3_EXECUTABLE}" -m pybind11 --cmakedir
+        OUTPUT_VARIABLE pybind11_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE _pb11_ret
+        ERROR_QUIET
+    )
+    if(_pb11_ret EQUAL 0 AND EXISTS "${pybind11_DIR}")
+        find_package(pybind11 CONFIG REQUIRED PATHS "${pybind11_DIR}")
+        add_subdirectory(python)
+        message(STATUS "Python bindings: ENABLED  (spade_cuda module will be built)")
+    else()
+        message(STATUS "Python bindings: DISABLED (pybind11 not found — run: pip install pybind11)")
+    endif()
+else()
+    message(STATUS "Python bindings: DISABLED (Python3 not found)")
+endif()
