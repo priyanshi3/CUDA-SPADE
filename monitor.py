@@ -50,6 +50,12 @@ except ImportError as exc:
     print("Run monitor.py from the repo root:  python monitor.py")
     sys.exit(1)
 
+try:
+    from spade.readers.modbus_reader import ModbusReader
+    HAS_MODBUS = True
+except ImportError:
+    HAS_MODBUS = False
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -167,7 +173,26 @@ def run_monitor(config: dict, demo_mode: bool):
     gpu_ok      = is_gpu_available()
     simulators  = {sc["id"]: SensorSimulator(sc, rng_seed=i)
                    for i, sc in enumerate(sensors_cfg)}
-    fault_rota  = [sc["id"] for sc in sensors_cfg]  # rotate faults across sensors
+    fault_rota  = [sc["id"] for sc in sensors_cfg]
+
+    # Live mode: open Modbus connections to the PLC (real or simulated)
+    readers: dict = {}
+    if not demo_mode:
+        if not HAS_MODBUS:
+            print("Live mode requires pymodbus.  Run: pip install pymodbus")
+            sys.exit(1)
+        print("Connecting to PLC via Modbus TCP ...")
+        for sc in sensors_cfg:
+            try:
+                r = ModbusReader(sc)
+                r.connect()
+                readers[sc["id"]] = r
+                print(f"  {sc.get('name', sc['id']):<22}  "
+                      f"{sc.get('host','localhost')}:{sc.get('port',5020)}  OK")
+            except ConnectionError as e:
+                print(f"\nERROR: {e}")
+                sys.exit(1)
+        print()
 
     # Initial display state for each sensor
     sensor_states = [
@@ -206,10 +231,19 @@ def run_monitor(config: dict, demo_mode: bool):
             n      = max(512, int(sr * poll_s))   # at least 512 samples
             inject = demo_mode and (sid == inject_id)
 
-            # In live mode you would call your sensor read function here:
-            #   data = read_modbus(sc) or read_daq(sc) etc.
-            # In demo mode we generate synthetic data.
-            data = simulators[sid].generate(n, inject_fault=inject)
+            # Data source: PLC registers (live) or synthetic generator (demo)
+            if demo_mode:
+                data = simulators[sid].generate(n, inject_fault=inject)
+            else:
+                try:
+                    data = readers[sid].read()
+                    n    = len(data)
+                except Exception as exc:
+                    # PLC offline mid-run — show zeros, keep running
+                    sensor_states[i]["value"] = 0.0
+                    dispatcher.send(sc.get("name", sid), "WARN",
+                                    f"PLC read failed: {exc}")
+                    continue
 
             # Run GPU (or CPU fallback) detection
             if algo == "zscore":
@@ -264,6 +298,9 @@ def run_monitor(config: dict, demo_mode: bool):
             console.print(f"\n[cyan]{msg.strip()}[/cyan]")
         else:
             print(msg)
+    finally:
+        for r in readers.values():
+            r.disconnect()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

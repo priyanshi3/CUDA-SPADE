@@ -1,45 +1,59 @@
 # CUDA-SPADE Configuration
 #
-# mode: "demo"  — synthetic sensors, faults injected automatically
-# mode: "live"  — read from real hardware (set protocol: under each sensor)
+# mode: "demo"  — synthetic sensors, faults injected automatically (no hardware needed)
+# mode: "live"  — read from real PLC via Modbus TCP
+#
+# DEMO WORKFLOW (two terminals, no hardware):
+#   Terminal 1:  python plc_sim.py   <- software PLC
+#   Terminal 2:  python monitor.py   <- GPU monitor
+#
+# LIVE WORKFLOW (real PLC):
+#   1. Set mode: live
+#   2. Set host: <PLC IP> and port: 502 under each sensor
+#   3. python monitor.py
 
-mode: demo
-poll_interval_s: 2.0          # seconds between detection cycles
+mode: demo             # change to "live" to connect real PLC
+poll_interval_s: 2.0   # seconds between detection cycles
 
 # ── Sensors ───────────────────────────────────────────────────────────────────
+# register_start and sample_count define where in the PLC register bank
+# this sensor's data lives.  Must match plc_sim.py REGISTER LAYOUT comment.
 sensors:
 
   - id: motor_temp
     name: "Motor Temperature"
-    sensor_type: temperature    # used for demo fault descriptions
+    sensor_type: temperature
     unit: "C"
-    sample_rate_hz: 100         # Hz — samples collected per second
-    baseline: 65.0              # deg C at normal load
+    sample_rate_hz: 100
+    baseline: 65.0
     noise: 0.3
     detection:
       algorithm: zscore
-      window: 100               # sliding window width in samples
-      threshold: 3.0            # flag if Z > threshold
-    # Live sensor (ignored in demo mode):
-    # protocol: modbus
-    # host: 192.168.1.100
-    # port: 502
-    # register: 40001
+      window: 100
+      threshold: 3.0
+    # PLC connection (used when mode: live):
+    host: localhost        # change to real PLC IP e.g. 192.168.1.100
+    port: 5020             # 5020 = plc_sim.py,  502 = real PLC
+    register_start: 0      # first register in PLC holding-register bank
+    sample_count: 200      # how many float samples to read per cycle
+    slave_id: 1            # Modbus unit ID (almost always 1)
 
   - id: bearing_vib
     name: "Bearing Vibration"
     sensor_type: vibration
     unit: "m/s2"
-    sample_rate_hz: 1000        # accelerometer at 1 kHz
+    sample_rate_hz: 1000
     baseline: 0.0
     noise: 0.05
     detection:
-      algorithm: fft            # cuFFT spectral analysis (Phase 3)
-      threshold_multiplier: 5.0 # flag bins > multiplier * median power
-    # Live sensor:
-    # protocol: daq
-    # device: "Dev1"
-    # channel: "ai0"
+      algorithm: fft
+      threshold_multiplier: 5.0
+    # PLC connection:
+    host: localhost
+    port: 5020
+    register_start: 400    # 200 samples × 2 regs = 400 regs after motor_temp
+    sample_count: 1000     # 1 second of vibration data at 1 kHz
+    slave_id: 1
 
   - id: hydraulic_pres
     name: "Hydraulic Pressure"
@@ -52,10 +66,12 @@ sensors:
       algorithm: zscore
       window: 100
       threshold: 3.5
-    # Live sensor:
-    # protocol: modbus
-    # host: 192.168.1.101
-    # register: 40010
+    # PLC connection:
+    host: localhost
+    port: 5020
+    register_start: 2400   # 400 + 1000×2 = 2400
+    sample_count: 200
+    slave_id: 1
 
   - id: motor_current
     name: "Motor Current"
@@ -68,17 +84,19 @@ sensors:
       algorithm: zscore
       window: 100
       threshold: 3.0
-    # Live sensor:
-    # protocol: modbus
-    # host: 192.168.1.100
-    # register: 40020
+    # PLC connection:
+    host: localhost
+    port: 5020
+    register_start: 2800   # 2400 + 200×2 = 2800
+    sample_count: 200
+    slave_id: 1
 
 # ── Alerts ────────────────────────────────────────────────────────────────────
 alerts:
-  log_file: "logs/spade_alerts.log"   # created automatically if missing
+  log_file: "logs/spade_alerts.log"
 
 # ── Demo settings ─────────────────────────────────────────────────────────────
 demo:
-  # Inject a fault every N cycles.  At 2 s/cycle, 15 cycles = every 30 s.
-  # Faults rotate: temp spike → bearing BPFO → pressure drop → current overload
+  # Fault injected every N cycles.  At 2 s/cycle → every 30 s.
+  # Rotation: motor_temp → bearing_vib → hydraulic_pres → motor_current → repeat
   fault_injection_interval_cycles: 15
