@@ -1,10 +1,11 @@
 // test_hello_gpu.cu
 //
-// Your "day one" test. Run this to confirm:
+// Run this to confirm:
 //   1. CUDA is installed correctly
 //   2. Your GPU is detected
 //   3. The vector addition kernel produces correct output
 //   4. The z-score kernel flags known anomalies
+//   5. The cuFFT kernel detects a bearing fault at 235 Hz
 //
 // Run after building:   ./tests/test_hello_gpu (Linux)
 //                       tests\test_hello_gpu.exe (Windows)
@@ -96,15 +97,88 @@ void test_zscore_detect() {
     CHECK(result.num_anomalies < 100, "False positive rate reasonable (<100 flags in 10K points)");
 }
 
+// ── Test 4: cuFFT bearing fault detection ────────────────────────────────────
+//
+// We inject a 235 Hz bearing fault into a healthy vibration signal and verify
+// the FFT detector finds it as the loudest spectral peak.
+//
+// Key design choice — why n=1000, sample_rate=1000?
+//   Bin width = sample_rate / n = 1.0 Hz.
+//   Every integer-Hz frequency lands EXACTLY on a bin centre.
+//   A sinusoid that fits perfectly into the FFT window contributes power to
+//   ONE bin only (no spectral leakage).  This gives a clean, predictable test:
+//   we inject 4 frequencies → exactly 4 bins get flagged.
+//
+//   With non-power-of-two n the FFT uses mixed-radix decomposition; cuFFT
+//   handles this automatically.
+void test_fft_detect() {
+    printf("\n[Test 4] cuFFT spectral bearing fault detection\n");
+
+    // 1000 samples at 1000 Hz = 1 second.  Bin width = 1 Hz.
+    const int   n              = 1000;
+    const float sample_rate_hz = 1000.0f;
+    const float PI             = 3.14159265358979f;
+
+    std::vector<float> data(n);
+
+    // Healthy vibration: 50 Hz fundamental + 100 Hz and 150 Hz harmonics.
+    // All three are integer Hz → land exactly on bins 50, 100, 150.
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / sample_rate_hz;
+        data[i] = 0.50f * sinf(2.0f * PI * 50.0f  * t)
+                + 0.20f * sinf(2.0f * PI * 100.0f * t)
+                + 0.08f * sinf(2.0f * PI * 150.0f * t);
+    }
+
+    // Inject BPFO bearing fault at exactly 235 Hz (bin 235).
+    // Amplitude 2.0 → power = 4.0, which is 16× the 50 Hz fundamental (0.5² = 0.25).
+    // The 235 Hz bin will dominate the spectrum and be returned as peak_freq.
+    for (int i = 0; i < n; i++) {
+        float t = (float)i / sample_rate_hz;
+        data[i] += 2.0f * sinf(2.0f * PI * 235.0f * t);
+    }
+
+    int num_bins = n / 2 + 1;   // 501 bins for n=1000
+    std::vector<int> bin_flags(num_bins, 0);
+    float peak_freq = 0.0f;
+
+    SpectralResult result = spade_fft_detect(
+        data.data(), bin_flags.data(), n,
+        sample_rate_hz,
+        /*threshold_multiplier=*/5.0f,
+        &peak_freq
+    );
+
+    printf("  GPU time (FFT + power kernel): %.3f ms\n", result.processing_ms);
+    printf("  Anomalous bins               : %d / %d\n",
+           result.num_anomalous_bins, num_bins);
+    printf("  Peak anomaly frequency       : %.1f Hz\n", peak_freq);
+
+    // For n=1000, sample_rate=1000: bin k = frequency in Hz exactly.
+    // bin 235 IS the 235 Hz BPFO bearing fault frequency.
+    // The three meaningful checks are:
+    //   1. Something was flagged at all.
+    //   2. The loudest flagged bin is the 235 Hz BPFO (not one of the healthy harmonics).
+    //   3. The 235 Hz bin itself is specifically flagged (direct confirmation).
+    bool found_anomalies    = (result.num_anomalous_bins > 0);
+    bool peak_near_bpfo     = (fabsf(peak_freq - 235.0f) < 2.0f);
+    bool bpfo_bin_flagged   = (bin_flags[235] == 1);
+
+    CHECK(found_anomalies,  "Spectral anomalies detected");
+    CHECK(peak_near_bpfo,   "Peak anomaly at ~235 Hz (bearing fault BPFO)");
+    CHECK(bpfo_bin_flagged, "Bin 235 (= 235 Hz BPFO) is explicitly flagged");
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 int main() {
     printf("=========================================\n");
-    printf("  CUDA-SPADE — Day 1 verification tests\n");
+    printf("  CUDA-SPADE — verification tests\n");
     printf("=========================================\n");
 
     test_device_info();
     test_vector_add();
     test_zscore_detect();
+    test_fft_detect();
 
     printf("\n=========================================\n");
     printf("  Done. If all tests PASS, you are ready.\n");

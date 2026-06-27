@@ -11,6 +11,8 @@
 #include <cufft.h>
 #include <cstdio>
 #include <cmath>
+#include <vector>
+#include <algorithm>
 
 // ── Helper macro ──────────────────────────────────────────────────────────────
 // Wraps every CUDA API call so errors are caught immediately with file/line info.
@@ -217,4 +219,154 @@ AnomalyResult spade_zscore_detect(
     CUDA_CHECK(cudaEventDestroy(stop_ev));
 
     return { num_anomalies, elapsed_ms };
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PHASE 3 — cuFFT spectral anomaly detection
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Why FFT for anomaly detection?
+//   The Z-score kernel catches spikes in raw amplitude.
+//   A bearing fault changes the vibration FREQUENCY CONTENT — a new peak
+//   appears at the BPFO frequency (~235 Hz for this machine).  In raw data
+//   that's nearly invisible; in the frequency domain it's an unmistakable spike.
+//
+// cuFFT R2C (real-to-complex) pipeline:
+//   Input:  n floats  (time domain)
+//   Output: n/2+1 complex bins  (frequency domain)
+//   Bin k → frequency = k × sample_rate_hz / n
+//
+// After the FFT we convert each complex bin to its POWER (re² + im²) with a
+// small custom kernel, then find the median power on the CPU and flag any bin
+// that exceeds threshold_multiplier × median.
+
+// ── cuFFT error checker (mirrors CUDA_CHECK) ──────────────────────────────────
+#define CUFFT_CHECK(call)                                                       \
+    do {                                                                        \
+        cufftResult _r = (call);                                                \
+        if (_r != CUFFT_SUCCESS) {                                              \
+            fprintf(stderr, "cuFFT error at %s:%d — code %d\n",                \
+                    __FILE__, __LINE__, (int)_r);                               \
+            exit(EXIT_FAILURE);                                                 \
+        }                                                                       \
+    } while (0)
+
+// ── Kernel: complex spectrum → power per bin ──────────────────────────────────
+//
+// cuFFT outputs cufftComplex = {float x (real), float y (imag)} for each bin.
+// Power = re² + im²  (squared magnitude — proportional to signal energy).
+// One thread per output bin — perfectly parallel, no dependencies.
+__global__ void kernel_compute_power(
+    const cufftComplex* spectrum,  // (n/2+1) complex bins from cuFFT
+    float*              power,     // (n/2+1) power values to fill
+    int                 num_bins
+) {
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= num_bins) return;
+    float re = spectrum[k].x;
+    float im = spectrum[k].y;
+    power[k] = re * re + im * im;
+}
+
+// ── Host wrapper ───────────────────────────────────────────────────────────────
+SpectralResult spade_fft_detect(
+    const float* data_host,
+    int*         bin_flags,
+    int          n,
+    float        sample_rate_hz,
+    float        threshold_multiplier,
+    float*       peak_freq_hz
+) {
+    int    num_bins   = n / 2 + 1;
+    size_t data_bytes = (size_t)n        * sizeof(float);
+    size_t comp_bytes = (size_t)num_bins * sizeof(cufftComplex);
+    size_t powr_bytes = (size_t)num_bins * sizeof(float);
+
+    // ── Step 1: Allocate GPU memory ───────────────────────────────────────────
+    float*        data_dev;
+    cufftComplex* spec_dev;
+    float*        powr_dev;
+    CUDA_CHECK(cudaMalloc(&data_dev, data_bytes));
+    CUDA_CHECK(cudaMalloc(&spec_dev, comp_bytes));
+    CUDA_CHECK(cudaMalloc(&powr_dev, powr_bytes));
+
+    // ── Step 2: Copy time-domain data to GPU ──────────────────────────────────
+    CUDA_CHECK(cudaMemcpy(data_dev, data_host, data_bytes, cudaMemcpyHostToDevice));
+
+    // ── Step 3: Create cuFFT plan ─────────────────────────────────────────────
+    // cufftPlan1d(plan, signal_length, transform_type, batch_count)
+    // CUFFT_R2C = Real-to-Complex: takes n floats, outputs n/2+1 complex values.
+    // The "1" at the end means we process 1 signal (not a batch).
+    cufftHandle plan;
+    CUFFT_CHECK(cufftPlan1d(&plan, n, CUFFT_R2C, 1));
+
+    // ── Step 4: Time FFT + power kernel together using CUDA events ────────────
+    cudaEvent_t ev_start, ev_stop;
+    CUDA_CHECK(cudaEventCreate(&ev_start));
+    CUDA_CHECK(cudaEventCreate(&ev_stop));
+    CUDA_CHECK(cudaEventRecord(ev_start));
+
+    // ── Step 5: Execute FFT — data_dev (float*) → spec_dev (complex*) ─────────
+    // cufftExecR2C fills spec_dev with (n/2+1) frequency-domain complex values.
+    CUFFT_CHECK(cufftExecR2C(plan, (cufftReal*)data_dev, spec_dev));
+
+    // ── Step 6: Convert complex bins → scalar power ───────────────────────────
+    int threads = 256;
+    int blocks  = (num_bins + threads - 1) / threads;
+    kernel_compute_power<<<blocks, threads>>>(spec_dev, powr_dev, num_bins);
+
+    CUDA_CHECK(cudaEventRecord(ev_stop));
+    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop));
+
+    // ── Step 7: Copy power spectrum back to CPU ────────────────────────────────
+    // num_bins is at most a few thousand — copying it is fast.
+    std::vector<float> power_host(num_bins);
+    CUDA_CHECK(cudaMemcpy(power_host.data(), powr_dev, powr_bytes, cudaMemcpyDeviceToHost));
+
+    // ── Step 8: Compute median power (baseline noise floor) ───────────────────
+    // Median is more robust than mean — a few loud peaks don't skew it.
+    // We sort a copy so the original order is preserved for flagging.
+    std::vector<float> sorted_power = power_host;
+    std::sort(sorted_power.begin(), sorted_power.end());
+    float median_power    = sorted_power[num_bins / 2];
+    float threshold_power = threshold_multiplier * (median_power + 1e-12f);
+
+    // ── Step 9: Flag anomalous bins and find the loudest one ──────────────────
+    // Skip bin 0 (DC component = signal mean, not meaningful for vibration).
+    int   num_anomalous = 0;
+    float peak_power    = -1.0f;
+    int   peak_bin      = -1;
+
+    bin_flags[0] = 0;  // always ignore DC
+    for (int k = 1; k < num_bins; k++) {
+        if (power_host[k] > threshold_power) {
+            bin_flags[k] = 1;
+            num_anomalous++;
+            if (power_host[k] > peak_power) {
+                peak_power = power_host[k];
+                peak_bin   = k;
+            }
+        } else {
+            bin_flags[k] = 0;
+        }
+    }
+
+    if (peak_freq_hz) {
+        *peak_freq_hz = (peak_bin >= 0)
+            ? (float)peak_bin * sample_rate_hz / (float)n
+            : -1.0f;
+    }
+
+    // ── Step 10: Cleanup ──────────────────────────────────────────────────────
+    CUFFT_CHECK(cufftDestroy(plan));
+    CUDA_CHECK(cudaFree(data_dev));
+    CUDA_CHECK(cudaFree(spec_dev));
+    CUDA_CHECK(cudaFree(powr_dev));
+    CUDA_CHECK(cudaEventDestroy(ev_start));
+    CUDA_CHECK(cudaEventDestroy(ev_stop));
+
+    return { num_anomalous, elapsed_ms };
 }
