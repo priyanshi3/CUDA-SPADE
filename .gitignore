@@ -1,0 +1,10 @@
+build/
+*.exe
+*.pdb
+*.ilk
+*.obj
+*.lib
+sensor_data.csv
+sensor_data.png
+__pycache__/
+*.pyc
