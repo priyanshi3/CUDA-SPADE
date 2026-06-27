@@ -370,3 +370,206 @@ SpectralResult spade_fft_detect(
 
     return { num_anomalous, elapsed_ms };
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// PHASE 4 — CUDA Streams + Shared Memory Optimisation
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// Problem with the Phase 2 naive kernel:
+//   Each thread reads its entire window (e.g. 100 values) from GLOBAL memory.
+//   Global memory latency ≈ 200 GPU clock cycles.
+//   Adjacent threads read OVERLAPPING data — thread i and thread i+1 both read
+//   data[i-49..i+50] and data[i-48..i+51], sharing 99 out of 100 values.
+//   All that shared data is fetched from global memory separately by each thread.
+//
+// Fix 1 — Shared memory (kernel_zscore_shared):
+//   A CUDA block of 256 threads cooperatively loads its data tile once into
+//   shared memory (48 KB on-chip cache, ≈5 cycle latency).
+//   Then every thread reads from shared memory instead of global memory.
+//
+//   Data loaded per block:  blockDim.x + window  (e.g. 256 + 100 = 356 floats)
+//   Data read naively:      blockDim.x × window  (e.g. 256 × 100 = 25,600 reads)
+//   Reduction ratio:        25,600 / 356 ≈ 72×  fewer global memory accesses.
+//
+// Fix 2 — CUDA Streams (spade_zscore_streamed):
+//   Without streams:  [H→D transfer] then [kernel] then [D→H transfer] sequentially.
+//   The GPU sits idle during PCIe transfers. Transfers sit idle during kernel.
+//
+//   With N streams:
+//     Stream 0: [H→D 0] ──────────── [kernel 0] ── [D→H 0]
+//     Stream 1:      [H→D 1] ── [kernel 1] ──────────── [D→H 1]
+//     Stream 2:           [H→D 2] ──────── [kernel 2] ──────── [D→H 2]
+//   Transfers and kernels OVERLAP → GPU and PCIe are both busy most of the time.
+//
+//   Requires PINNED (page-locked) host memory — regular malloc'd pages can be
+//   swapped out by the OS, which prevents the DMA engine from running async.
+
+#define MAX_STREAMS 4
+
+// ── Kernel: shared memory cached sliding window Z-score ───────────────────────
+//
+// Shared memory layout for a block covering global indices [B, B + blockDim.x):
+//   smem[k] = data[B - half + k]   for k = 0 … (blockDim.x + window - 1)
+//
+// So thread threadIdx.x (global index i = B + threadIdx.x):
+//   - Its window [i-half … i+half] maps to smem[threadIdx.x … threadIdx.x+window]
+//   - It accesses its own value via smem[threadIdx.x + half]
+//
+// Launch with dynamic shared memory: kernel<<<B, T, (T+window)*sizeof(float)>>>
+//
+__global__ void kernel_zscore_shared(
+    const float* __restrict__ data,
+    int*         flags,
+    int          n,
+    int          window,
+    float        threshold
+) {
+    extern __shared__ float smem[];
+
+    const int half        = window / 2;
+    const int block_start = (int)(blockIdx.x * blockDim.x);
+    const int global_i    = block_start + (int)threadIdx.x;
+    const int smem_n      = (int)blockDim.x + window;  // total elements to cache
+
+    // ── Cooperative load into shared memory ───────────────────────────────────
+    // Loop in steps of blockDim.x so every element is loaded even when
+    // smem_n > blockDim.x (which is always true since window > 0).
+    // Each iteration, one thread covers one element of the shared tile.
+    for (int k = (int)threadIdx.x; k < smem_n; k += (int)blockDim.x) {
+        int src = block_start - half + k;
+        smem[k] = (src >= 0 && src < n) ? data[src] : 0.0f;
+    }
+    // ← MUST wait until every thread finishes loading before any thread reads.
+    //   Without __syncthreads(), a fast thread might read shared memory before
+    //   a slower thread has written its element.
+    __syncthreads();
+
+    if (global_i >= n) return;
+
+    // ── Clamp window to array bounds (handles first/last few blocks) ──────────
+    const int win_start = max(0, global_i - half);
+    const int win_end   = min(n - 1, global_i + half);
+    const int count     = win_end - win_start + 1;
+
+    // ── Map global indices → shared memory offsets ────────────────────────────
+    // data[j] lives at smem[j - block_start + half]
+    const int s_start = win_start - block_start + half;
+    const int s_end   = win_end   - block_start + half;
+    const int s_self  = (int)threadIdx.x + half;        // smem index of data[global_i]
+
+    // ── Pass 1: mean ──────────────────────────────────────────────────────────
+    float sum = 0.0f;
+    for (int j = s_start; j <= s_end; j++) sum += smem[j];
+    const float mean = sum / (float)count;
+
+    // ── Pass 2: standard deviation ────────────────────────────────────────────
+    float sq = 0.0f;
+    for (int j = s_start; j <= s_end; j++) {
+        float d = smem[j] - mean;
+        sq += d * d;
+    }
+    const float std_dev = sqrtf(sq / (float)count);
+
+    // ── Z-score and flag ──────────────────────────────────────────────────────
+    // Note: a future optimisation here is __shfl_down_sync to accumulate sum/sq
+    // across the warp without shared memory round-trips (Phase 5 material).
+    const float z = (std_dev > 1e-6f)
+        ? fabsf(smem[s_self] - mean) / std_dev
+        : 0.0f;
+    flags[global_i] = (z > threshold) ? 1 : 0;
+}
+
+// ── Multi-stream host wrapper ─────────────────────────────────────────────────
+AnomalyResult spade_zscore_streamed(
+    const float* data_host,
+    int*         flags_host,
+    int          n,
+    int          window,
+    float        threshold,
+    int          num_streams
+) {
+    if (num_streams < 1)          num_streams = 1;
+    if (num_streams > MAX_STREAMS) num_streams = MAX_STREAMS;
+
+    // ── Step 1: Allocate PINNED host buffers ──────────────────────────────────
+    // cudaMallocHost gives page-locked memory that the DMA engine can access
+    // directly.  This is what allows cudaMemcpyAsync to truly run in the
+    // background without CPU involvement.
+    float* pinned_in;
+    int*   pinned_out;
+    CUDA_CHECK(cudaMallocHost(&pinned_in,  (size_t)n * sizeof(float)));
+    CUDA_CHECK(cudaMallocHost(&pinned_out, (size_t)n * sizeof(int)));
+    memcpy(pinned_in, data_host, (size_t)n * sizeof(float));
+
+    // ── Step 2: Allocate one GPU buffer and one stream per batch ──────────────
+    const int batch = (n + num_streams - 1) / num_streams;
+
+    float*       d_data[MAX_STREAMS]  = {};
+    int*         d_flags[MAX_STREAMS] = {};
+    cudaStream_t streams[MAX_STREAMS] = {};
+
+    for (int s = 0; s < num_streams; s++) {
+        CUDA_CHECK(cudaMalloc(&d_data[s],  (size_t)batch * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_flags[s], (size_t)batch * sizeof(int)));
+        CUDA_CHECK(cudaStreamCreate(&streams[s]));
+    }
+
+    // ── Step 3: Time the full multi-stream operation ───────────────────────────
+    cudaEvent_t ev_start, ev_stop;
+    CUDA_CHECK(cudaEventCreate(&ev_start));
+    CUDA_CHECK(cudaEventCreate(&ev_stop));
+    CUDA_CHECK(cudaEventRecord(ev_start));  // fires immediately on null stream
+
+    // ── Step 4: Enqueue all batches — the GPU overlaps them automatically ─────
+    const int    threads    = 256;
+    const size_t smem_bytes = (size_t)(threads + window) * sizeof(float);
+
+    for (int s = 0; s < num_streams; s++) {
+        const int offset = s * batch;
+        const int size   = min(batch, n - offset);
+        if (size <= 0) break;
+
+        // Async CPU→GPU: DMA runs while previous stream's kernel executes
+        CUDA_CHECK(cudaMemcpyAsync(
+            d_data[s], pinned_in + offset,
+            (size_t)size * sizeof(float), cudaMemcpyHostToDevice, streams[s]));
+
+        // Kernel executes after the memcpy IN THIS STREAM completes.
+        // Kernels on different streams run concurrently on the GPU.
+        const int blocks = (size + threads - 1) / threads;
+        kernel_zscore_shared<<<blocks, threads, smem_bytes, streams[s]>>>(
+            d_data[s], d_flags[s], size, window, threshold);
+
+        // Async GPU→CPU: DMA runs while the next stream's kernel executes
+        CUDA_CHECK(cudaMemcpyAsync(
+            pinned_out + offset, d_flags[s],
+            (size_t)size * sizeof(int), cudaMemcpyDeviceToHost, streams[s]));
+    }
+
+    // ── Step 5: Wait for ALL streams, then record end time ────────────────────
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaEventRecord(ev_stop));
+    CUDA_CHECK(cudaEventSynchronize(ev_stop));
+
+    float elapsed_ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, ev_start, ev_stop));
+
+    // ── Step 6: Copy results and count anomalies ──────────────────────────────
+    memcpy(flags_host, pinned_out, (size_t)n * sizeof(int));
+
+    int num_anomalies = 0;
+    for (int i = 0; i < n; i++) num_anomalies += flags_host[i];
+
+    // ── Step 7: Cleanup ───────────────────────────────────────────────────────
+    for (int s = 0; s < num_streams; s++) {
+        CUDA_CHECK(cudaStreamDestroy(streams[s]));
+        CUDA_CHECK(cudaFree(d_data[s]));
+        CUDA_CHECK(cudaFree(d_flags[s]));
+    }
+    CUDA_CHECK(cudaFreeHost(pinned_in));
+    CUDA_CHECK(cudaFreeHost(pinned_out));
+    CUDA_CHECK(cudaEventDestroy(ev_start));
+    CUDA_CHECK(cudaEventDestroy(ev_stop));
+
+    return { num_anomalies, elapsed_ms };
+}

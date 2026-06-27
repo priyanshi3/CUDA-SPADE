@@ -62,3 +62,33 @@ SpectralResult spade_fft_detect(
     float        threshold_multiplier, // flag bins above X × median power (e.g. 5.0)
     float*       peak_freq_hz          // OUTPUT: Hz of loudest anomalous bin (or -1)
 );
+
+// ── Phase 4: CUDA streams + shared memory optimisation ────────────────────────
+
+// Processes sensor_data in `num_streams` parallel batches using CUDA streams,
+// with an optimised Z-score kernel that caches window data in shared memory.
+//
+// Why faster than spade_zscore_detect:
+//   1. Shared memory kernel: threads cooperatively load their window data into
+//      fast on-chip memory (5-cycle latency) instead of reading repeatedly from
+//      slow global memory (200-cycle latency).  ~72× fewer expensive reads.
+//
+//   2. CUDA streams: each stream independently runs [copy to GPU] → [kernel]
+//      → [copy results back].  Three streams run concurrently, so the GPU is
+//      computing batch 1 while batch 2 is being transferred in, etc.
+//
+// Requirements:
+//   - num_streams: 2–4.  3 is the sweet spot for most GPUs.
+//   - Input does NOT need to be pinned; pinned buffers are allocated internally.
+//
+// Limitation: samples within window/2 of a batch boundary see a truncated
+// window (only their own batch's data).  For large n and small window this
+// affects < 0.1% of samples and is negligible in practice.
+AnomalyResult spade_zscore_streamed(
+    const float* sensor_data,   // HOST: n sensor readings
+    int*         anomaly_flags, // HOST: n output flags (1 = anomaly)
+    int          n,
+    int          window,
+    float        threshold,
+    int          num_streams    // typically 3
+);
